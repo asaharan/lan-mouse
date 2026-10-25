@@ -10,7 +10,7 @@ use core_foundation::{
 };
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
-    display::{CGDisplay, CGPoint},
+    display::{CGDisplay, CGPoint, CGRect},
     event::{
         CGEvent, CGEventField, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
         CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
@@ -44,6 +44,26 @@ struct Bounds {
     xmax: f64,
     ymin: f64,
     ymax: f64,
+}
+
+/// Smallest box containing all `rects`, or `None` if there are none.
+fn bounds_from_rects(rects: &[CGRect]) -> Option<Bounds> {
+    if rects.is_empty() {
+        return None;
+    }
+    let mut b = Bounds {
+        xmin: f64::INFINITY,
+        xmax: f64::NEG_INFINITY,
+        ymin: f64::INFINITY,
+        ymax: f64::NEG_INFINITY,
+    };
+    for r in rects {
+        b.xmin = b.xmin.min(r.origin.x);
+        b.xmax = b.xmax.max(r.origin.x + r.size.width);
+        b.ymin = b.ymin.min(r.origin.y);
+        b.ymax = b.ymax.max(r.origin.y + r.size.height);
+    }
+    Some(b)
 }
 
 #[derive(Debug)]
@@ -101,19 +121,29 @@ impl InputCaptureState {
         None
     }
 
-    // Get the max bounds of all displays
+    // Recompute the bounds of all active displays from scratch
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
+        let rects: Vec<CGRect> = active_ids
+            .iter()
+            .map(|&d| {
+                let rect = CGDisplay::new(d).bounds();
+                log::debug!("display {d}: {rect:?}");
+                rect
+            })
+            .collect();
 
-        log::debug!("Updated displays bounds: {0:?}", self.bounds);
+        match bounds_from_rects(&rects) {
+            Some(bounds) => {
+                self.bounds = bounds;
+                log::debug!("Updated displays bounds: {0:?}", self.bounds);
+            }
+            None => log::warn!(
+                "no active displays reported, keeping previous bounds: {:?}",
+                self.bounds
+            ),
+        }
         Ok(())
     }
 
@@ -895,5 +925,49 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_graphics::display::CGSize;
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect::new(&CGPoint::new(x, y), &CGSize::new(w, h))
+    }
+
+    fn assert_bounds(b: &Bounds, xmin: f64, xmax: f64, ymin: f64, ymax: f64) {
+        assert_eq!((b.xmin, b.xmax, b.ymin, b.ymax), (xmin, xmax, ymin, ymax));
+    }
+
+    #[test]
+    fn single_display() {
+        let b = bounds_from_rects(&[rect(0.0, 0.0, 1920.0, 1080.0)]).unwrap();
+        assert_bounds(&b, 0.0, 1920.0, 0.0, 1080.0);
+    }
+
+    #[test]
+    fn side_by_side_with_negative_origin() {
+        let b = bounds_from_rects(&[
+            rect(0.0, 0.0, 2560.0, 1440.0),
+            rect(-1920.0, 100.0, 1920.0, 1080.0),
+        ])
+        .unwrap();
+        assert_bounds(&b, -1920.0, 2560.0, 0.0, 1440.0);
+    }
+
+    #[test]
+    fn bounds_shrink_after_reconfiguration() {
+        let left = rect(-1920.0, 0.0, 1920.0, 1080.0);
+        let wide = bounds_from_rects(&[left, rect(0.0, 0.0, 5120.0, 2880.0)]).unwrap();
+        assert_eq!(wide.xmax, 5120.0);
+        let narrow = bounds_from_rects(&[left, rect(0.0, 0.0, 2560.0, 1440.0)]).unwrap();
+        assert_bounds(&narrow, -1920.0, 2560.0, 0.0, 1440.0);
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(bounds_from_rects(&[]).is_none());
     }
 }
